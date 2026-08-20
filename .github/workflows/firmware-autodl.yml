@@ -1,0 +1,1195 @@
+name: Switch 固件自动下载发布
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: nx-firmware-auto-release
+  cancel-in-progress: false
+
+jobs:
+  check_update:
+    name: 检查 Switch 固件更新
+    if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      new_version: ${{ steps.detect.outputs.new_version }}
+      firmware_version: ${{ steps.detect.outputs.firmware_version }}
+    steps:
+      - name: 检测最新未发布的 Switch 1 固件
+        id: detect
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import xml.etree.ElementTree as ET
+
+          FEED_URL = "https://yls8.mtheall.com/ninupdates/feed.php"
+          MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+          MAX_COMPARE_BYTES = 16 * 1024 * 1024
+          VERSION_RE = re.compile(r"^Switch\s+(\d{1,3})\.(\d{1,3})\.(\d{1,3})$")
+
+          def fetch(url, headers=None):
+              request = urllib.request.Request(url, headers=headers or {})
+              return urllib.request.urlopen(request, timeout=30)
+
+          with fetch(FEED_URL, {"User-Agent": "NX-Firmware-Auto/1.0"}) as response:
+              feed_data = response.read(MAX_RESPONSE_BYTES + 1)
+          if len(feed_data) > MAX_RESPONSE_BYTES:
+              raise SystemExit("The update feed response is too large")
+          try:
+              root = ET.fromstring(feed_data)
+          except ET.ParseError as error:
+              raise SystemExit("The update feed returned invalid XML") from error
+
+          versions = set()
+          for item in root.findall("./channel/item"):
+              title = (item.findtext("title") or "").strip()
+              link = (item.findtext("link") or item.findtext("guid") or "").strip()
+              match = VERSION_RE.fullmatch(title)
+              if not match:
+                  continue
+              query = urllib.parse.parse_qs(urllib.parse.urlparse(link).query)
+              if query.get("sys") != ["hac"]:
+                  continue
+              versions.add(tuple(map(int, match.groups())))
+
+          if not versions:
+              raise SystemExit("No Switch 1 firmware version was found in the update feed")
+
+          latest = max(versions)
+          if latest[0] < 21:
+              raise SystemExit("The latest detected firmware is below the supported minimum 21.0.0")
+          version = ".".join(map(str, latest))
+
+          repository = os.environ["GH_REPOSITORY"]
+          api_url = f"https://api.github.com/repos/{repository}/releases/tags/{version}"
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+              "User-Agent": "NX-Firmware-Auto/1.0",
+              "X-GitHub-Api-Version": "2026-03-10",
+          }
+
+          release = None
+          try:
+              with fetch(api_url, headers) as response:
+                  status = response.status
+                  release_data = response.read(MAX_RESPONSE_BYTES + 1)
+                  if len(release_data) > MAX_RESPONSE_BYTES:
+                      raise SystemExit("GitHub release lookup returned too much data")
+                  release = json.loads(release_data)
+          except urllib.error.HTTPError as error:
+              status = error.code
+          except (UnicodeDecodeError, json.JSONDecodeError) as error:
+              raise SystemExit("GitHub release lookup returned invalid JSON") from error
+
+          if status not in (200, 404):
+              raise SystemExit(f"GitHub release lookup failed with HTTP {status}")
+          if status == 200 and not isinstance(release, dict):
+              raise SystemExit("GitHub release lookup returned an invalid response")
+
+          tag_api_url = f"https://api.github.com/repos/{repository}/git/ref/tags/{version}"
+          tag = None
+          try:
+              with fetch(tag_api_url, headers) as response:
+                  tag_status = response.status
+                  tag_data = response.read(MAX_RESPONSE_BYTES + 1)
+                  if len(tag_data) > MAX_RESPONSE_BYTES:
+                      raise SystemExit("GitHub tag lookup returned too much data")
+                  tag = json.loads(tag_data)
+          except urllib.error.HTTPError as error:
+              tag_status = error.code
+          except (UnicodeDecodeError, json.JSONDecodeError) as error:
+              raise SystemExit("GitHub tag lookup returned invalid JSON") from error
+          if tag_status == 200:
+              tag_exists = (
+                  isinstance(tag, dict)
+                  and tag.get("ref") == f"refs/tags/{version}"
+              )
+              if not tag_exists:
+                  raise SystemExit("GitHub tag lookup returned an invalid response")
+          elif tag_status == 404:
+              tag_exists = False
+          else:
+              raise SystemExit(f"GitHub tag lookup failed with HTTP {tag_status}")
+
+          tag_history_safe = False
+          if tag_exists:
+              tag_object = tag.get("object")
+              if not isinstance(tag_object, dict) or tag_object.get("type") != "commit":
+                  raise SystemExit("The firmware tag must be a lightweight commit tag")
+              tag_commit = tag_object.get("sha")
+              if not isinstance(tag_commit, str) or not re.fullmatch(
+                  r"[0-9a-f]{40,64}", tag_commit
+              ):
+                  raise SystemExit("GitHub returned an invalid tag commit")
+              workflow_sha = os.environ["GH_WORKFLOW_SHA"]
+              if not re.fullmatch(r"[0-9a-f]{40,64}", workflow_sha):
+                  raise SystemExit("GitHub supplied an invalid workflow commit")
+              compare_api_url = (
+                  f"https://api.github.com/repos/{repository}/compare/"
+                  f"{tag_commit}...{workflow_sha}"
+              )
+              try:
+                  with fetch(compare_api_url, headers) as response:
+                      compare_status = response.status
+                      compare_data = response.read(MAX_COMPARE_BYTES + 1)
+                      if len(compare_data) > MAX_COMPARE_BYTES:
+                          raise SystemExit("GitHub compare lookup returned too much data")
+                      comparison = json.loads(compare_data)
+              except urllib.error.HTTPError as error:
+                  compare_status = error.code
+              except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                  raise SystemExit("GitHub compare lookup returned invalid JSON") from error
+              if compare_status != 200 or not isinstance(comparison, dict):
+                  raise SystemExit(
+                      f"GitHub tag comparison failed with HTTP {compare_status}"
+                  )
+              tag_history_safe = comparison.get("status") in ("ahead", "identical")
+              if not tag_history_safe:
+                  raise SystemExit(
+                      "The firmware tag is not on the current default-branch history"
+                  )
+
+          if status == 200:
+              if not tag_exists:
+                  raise SystemExit("The published firmware release is missing its Git tag")
+              expected_asset = f"Firmware {version}.zip"
+              assets = release.get("assets")
+              complete_asset = (
+                  isinstance(assets, list)
+                  and any(
+                      isinstance(asset, dict)
+                      and asset.get("name") in (expected_asset, expected_asset.replace(" ", "."))
+                      and asset.get("state") == "uploaded"
+                      and type(asset.get("size")) is int
+                      and asset["size"] > 0
+                      for asset in assets
+                  )
+              )
+              complete_release = (
+                  release.get("draft") is False
+                  and release.get("prerelease") is False
+                  and tag_exists
+                  and tag_history_safe
+                  and complete_asset
+              )
+              is_new = "false" if complete_release else "true"
+              if complete_release:
+                  print(f"固件 {version} 已存在完整发布，跳过后续处理")
+              else:
+                  print(f"固件 {version} 存在不完整发布，将自动触发修复流程")
+          elif status == 404:
+              is_new = "true"
+              print(f"检测到新固件 {version} 尚未发布，准备开始处理")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"new_version={is_new}\n")
+              output.write(f"firmware_version={version}\n")
+          PY
+
+  release:
+    name: 下载、校验并发布固件
+    needs: check_update
+    if: ${{ needs.check_update.outputs.new_version == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.check_update.outputs.firmware_version }}
+    steps:
+      - name: 编译指定版本的 hactool
+        shell: bash
+        env:
+          HACTOOL_COMMIT: 1d64a83450e025622f3468c28fc4164dad2c5ef6
+          HACTOOL_DIR: ${{ runner.temp }}/nx-hactool
+        run: |
+          set -euo pipefail
+          install -d -m 700 "$HACTOOL_DIR"
+          git init -q "$HACTOOL_DIR/source"
+          git -C "$HACTOOL_DIR/source" remote add origin https://github.com/SciresM/hactool.git
+          git -C "$HACTOOL_DIR/source" fetch --quiet --depth=1 origin "$HACTOOL_COMMIT"
+          git -C "$HACTOOL_DIR/source" checkout --quiet --detach FETCH_HEAD
+          actual_commit="$(git -C "$HACTOOL_DIR/source" rev-parse HEAD)"
+          test "$actual_commit" = "$HACTOOL_COMMIT"
+          cp "$HACTOOL_DIR/source/config.mk.template" "$HACTOOL_DIR/source/config.mk"
+          make -C "$HACTOOL_DIR/source" -j2 >/dev/null
+          install -m 755 "$HACTOOL_DIR/source/hactool" "$HACTOOL_DIR/hactool"
+          test -x "$HACTOOL_DIR/hactool"
+
+      - name: 下载并校验官方固件
+        shell: bash
+        env:
+          HACTOOL_DIR: ${{ runner.temp }}/nx-hactool
+          DIST_DIR: ${{ runner.temp }}/nx-firmware-dist
+          NX_CLIENT_CERT_PEM_B64: ${{ secrets.NX_CLIENT_CERT_PEM_B64 }}
+          NX_CLIENT_KEY_PEM_B64: ${{ secrets.NX_CLIENT_KEY_PEM_B64 }}
+          NX_DEVICE_ID: ${{ secrets.NX_DEVICE_ID }}
+          NX_HACTOOL_KEYS_B64: ${{ secrets.NX_HACTOOL_KEYS_B64 }}
+        run: |
+          set -euo pipefail
+          set +x
+          umask 077
+          ulimit -c 0
+
+          : "${NX_CLIENT_CERT_PEM_B64:?缺少 NX_CLIENT_CERT_PEM_B64 Secret 配置}"
+          : "${NX_CLIENT_KEY_PEM_B64:?缺少 NX_CLIENT_KEY_PEM_B64 Secret 配置}"
+          : "${NX_DEVICE_ID:?缺少 NX_DEVICE_ID Secret 配置}"
+          : "${NX_HACTOOL_KEYS_B64:?缺少 NX_HACTOOL_KEYS_B64 Secret 配置}"
+          [[ "$NX_DEVICE_ID" =~ ^[0-9A-Fa-f]{16}$ ]] || {
+            echo "NX_DEVICE_ID 必须为恰好 16 位十六进制字符" >&2
+            exit 1
+          }
+          device_id="$NX_DEVICE_ID"
+          unset NX_DEVICE_ID
+
+          mtls_dir="$(mktemp -d "$RUNNER_TEMP/nx-fw-mtls.XXXXXX")"
+          keyset_dir="$(mktemp -d "$RUNNER_TEMP/nx-fw-keyset.XXXXXX")"
+          work_dir="$(mktemp -d "$RUNNER_TEMP/nx-fw-work.XXXXXX")"
+          cleanup() {
+            rm -rf "$mtls_dir" "$keyset_dir" "$work_dir"
+          }
+          trap cleanup EXIT
+
+          printf '%s' "$NX_CLIENT_CERT_PEM_B64" | base64 --decode > "$mtls_dir/client.crt"
+          printf '%s' "$NX_CLIENT_KEY_PEM_B64" | base64 --decode > "$mtls_dir/client.key"
+          printf '%s' "$NX_HACTOOL_KEYS_B64" | base64 --decode > "$keyset_dir/hactool.keys"
+          unset NX_CLIENT_CERT_PEM_B64 NX_CLIENT_KEY_PEM_B64 NX_HACTOOL_KEYS_B64
+          chmod 600 "$mtls_dir/client.crt" "$mtls_dir/client.key" "$keyset_dir/hactool.keys"
+
+          openssl x509 -in "$mtls_dir/client.crt" -noout -checkend 3600 >/dev/null
+          openssl x509 -in "$mtls_dir/client.crt" -pubkey -noout > "$mtls_dir/cert.pub"
+          openssl pkey -in "$mtls_dir/client.key" -passin pass: -pubout > "$mtls_dir/key.pub"
+          cmp -s "$mtls_dir/cert.pub" "$mtls_dir/key.pub" || {
+            echo "客户端证书与私钥不匹配" >&2
+            exit 1
+          }
+          install -d -m 700 "$DIST_DIR"
+          export NX_CLIENT_CERT_PATH="$mtls_dir/client.crt"
+          export NX_CLIENT_KEY_PATH="$mtls_dir/client.key"
+          export NX_HACTOOL_KEYS_PATH="$keyset_dir/hactool.keys"
+          export NX_WORK_DIR="$work_dir"
+          export NX_HACTOOL_PATH="$HACTOOL_DIR/hactool"
+
+          NX_DEVICE_ID="$device_id" python3 - <<'PY'
+          import concurrent.futures
+          import hashlib
+          import http.client
+          import json
+          import os
+          import pathlib
+          import re
+          import shutil
+          import ssl
+          import struct
+          import subprocess
+          import tempfile
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import zipfile
+
+          VERSION = os.environ["VERSION"]
+          DEVICE_ID = os.environ.pop("NX_DEVICE_ID")
+          CERT_PATH = os.environ["NX_CLIENT_CERT_PATH"]
+          KEY_PATH = os.environ["NX_CLIENT_KEY_PATH"]
+          KEYSET_PATH = os.environ["NX_HACTOOL_KEYS_PATH"]
+          HACTOOL_PATH = os.environ["NX_HACTOOL_PATH"]
+          WORK_DIR = pathlib.Path(os.environ["NX_WORK_DIR"])
+          DIST_DIR = pathlib.Path(os.environ["DIST_DIR"])
+          FIRMWARE_DIR = WORK_DIR / f"Firmware {VERSION}"
+          ENVIRONMENT = "lp1"
+          USER_AGENT = (
+              "NintendoSDK Firmware/11.0.0-0 "
+              f"(platform:NX; did:{DEVICE_ID}; eid:{ENVIRONMENT})"
+          )
+          VERSION_PATTERN = re.compile(r"^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$")
+          HEX_16 = re.compile(r"^[0-9a-f]{16}$")
+          HEX_32 = re.compile(r"^[0-9a-f]{32}$")
+          HEX_64 = re.compile(r"^[0-9a-f]{64}$")
+          RETRYABLE_HTTP = {429, 500, 502, 503, 504}
+          MAX_JSON_BYTES = 1024 * 1024
+          MAX_DOWNLOAD_BYTES = 8 * 1024 * 1024 * 1024
+          MAX_CNMT_BYTES = 16 * 1024 * 1024
+          MAX_SYSTEM_TITLES = 4096
+          MAX_CNMT_CONTENTS = 8192
+          MAX_CONTENT_ITEMS = 16384
+          MAX_TOTAL_CONTENT_BYTES = 8 * 1024 * 1024 * 1024
+          ALLOWED_KEY_NAMES = re.compile(
+              r"^(header_key|key_area_key_(application|ocean|system)_[01][0-9a-f])$"
+          )
+          NINTENDO_CA_SHA256 = (
+              "58054caa85da74b2b9f3407b17bb8428040e46a9159a1afb9f58cadac27642c0"
+          )
+          NINTENDO_CA_PEM = """-----BEGIN CERTIFICATE-----
+          MIIErDCCA5SgAwIBAgIBATANBgkqhkiG9w0BAQsFADCBmjELMAkGA1UEBhMCVVMx
+          EzARBgNVBAgTCldhc2hpbmd0b24xIjAgBgNVBAoTGU5pbnRlbmRvIG9mIEFtZXJp
+          Y2EsIEluYy4xCzAJBgNVBAsTAklTMSEwHwYDVQQDExhOaW50ZW5kbyBDbGFzcyAy
+          IENBIC0gRzMxIjAgBgkqhkiG9w0BCQEWE2NhQG5vYS5uaW50ZW5kby5jb20wHhcN
+          MTAwNDI5MTU1OTE4WhcNNDkxMjI4MTIwMDAwWjCBmjELMAkGA1UEBhMCVVMxEzAR
+          BgNVBAgTCldhc2hpbmd0b24xIjAgBgNVBAoTGU5pbnRlbmRvIG9mIEFtZXJpY2Es
+          IEluYy4xCzAJBgNVBAsTAklTMSEwHwYDVQQDExhOaW50ZW5kbyBDbGFzcyAyIENB
+          IC0gRzMxIjAgBgkqhkiG9w0BCQEWE2NhQG5vYS5uaW50ZW5kby5jb20wggEiMA0G
+          CSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDR0JlLuTabiKUVeaW1znP7dJ3m2vcu
+          SQk3QKAJf6inQREJIMG8LknTvdvX5Lmiwxd2P5hiSzmCzQyxMWN38zpQKzlW92es
+          FdwBnuUH9pXMDZBCcBEiwg2PxqNw4WdxlmRZ92R4g0Keenwh2GiETA2Ml2rasCCW
+          39TYNW7i8W0YQw7u1ZaMQ1GetWrvblt9UhmC7ZbI0pqJcBOZzR0tNbl79QT2WF8r
+          bRsSANlRi/H4LnjkMxrKrRYybLEfjDGBBfubhENKPRjUBEmp55gE2v0sVkLNLh2H
+          awCuSl+dpEG0D6BB/6/wZxxQdSbGVT6ahQRlHOVn0GZm4QC+Sc5yFYthAgMBAAGj
+          gfowgfcwHQYDVR0OBBYEFPfGCnxyfCzEvJMoQeTucPADoLu3MIHHBgNVHSMEgb8w
+          gbyAFPfGCnxyfCzEvJMoQeTucPADoLu3oYGgpIGdMIGaMQswCQYDVQQGEwJVUzET
+          MBEGA1UECBMKV2FzaGluZ3RvbjEiMCAGA1UEChMZTmludGVuZG8gb2YgQW1lcmlj
+          YSwgSW5jLjELMAkGA1UECxMCSVMxITAfBgNVBAMTGE5pbnRlbmRvIENsYXNzIDIg
+          Q0EgLSBHMzEiMCAGCSqGSIb3DQEJARYTY2FAbm9hLm5pbnRlbmRvLmNvbYIBATAM
+          BgNVHRMEBTADAQH/MA0GCSqGSIb3DQEBCwUAA4IBAQBE8V5A4HX/B3D2pbterUv8
+          P1hYXvF+qXXRLzEEmYSYDEC6eC/6biw1GmU1xamiuwzZC/1Llqv/9tUOsRiqbCcZ
+          y6PoplpfuoJpmoQltuP+hibDk6jSadEH1eK94P/6EnNpRHrgk5z4QVuXLmTi8iM6
+          7T5cVtqgXGhTOka6/AquzjrnJZA7q6OjH7soy+Ap4GW5iO3oNbfMcYWT25qVzhgV
+          cmm6niKF7yQY59H/XOaPOsL/fZlCRkp+UUxg/yj3bo+A34VSW8xlCu87HlVkKwlJ
+          4k5aF4MhHCbunoBTYwGhRC0hIlyvzIzG+Ky56UOimnZwztfJxA91uZzKPkWy5s43
+          -----END CERTIFICATE-----"""
+
+          class WorkflowError(RuntimeError):
+              pass
+
+          class HttpStatusError(WorkflowError):
+              def __init__(self, label, status):
+                  super().__init__(f"{label} failed with HTTP {status}")
+                  self.status = status
+
+          def validate_inputs():
+              if not VERSION_PATTERN.fullmatch(VERSION):
+                  raise WorkflowError("Firmware version must use major.minor.patch format")
+              if not re.fullmatch(r"[0-9A-Fa-f]{16}", DEVICE_ID):
+                  raise WorkflowError("Device ID has an invalid format")
+              if not pathlib.Path(HACTOOL_PATH).is_file() or not os.access(
+                  HACTOOL_PATH, os.X_OK
+              ):
+                  raise WorkflowError("hactool executable is missing")
+
+              names = set()
+              with open(KEYSET_PATH, "r", encoding="utf-8") as keyset:
+                  for number, raw_line in enumerate(keyset, 1):
+                      line = raw_line.strip()
+                      if not line or line.startswith(("#", ";")):
+                          continue
+                      if "=" not in line:
+                          raise WorkflowError(f"Invalid keyset syntax on line {number}")
+                      name, value = (part.strip().lower() for part in line.split("=", 1))
+                      if not ALLOWED_KEY_NAMES.fullmatch(name):
+                          raise WorkflowError(f"Unexpected key name in minimal keyset: {name}")
+                      expected_length = 64 if name == "header_key" else 32
+                      if not re.fullmatch(r"[0-9a-f]+", value) or len(value) != expected_length:
+                          raise WorkflowError(f"Invalid value format for key {name}")
+                      if name in names:
+                          raise WorkflowError(f"Duplicate key in keyset: {name}")
+                      names.add(name)
+              if "header_key" not in names:
+                  raise WorkflowError("The minimal keyset does not contain header_key")
+              for family in ("application", "ocean", "system"):
+                  prefix = f"key_area_key_{family}_"
+                  if not any(name.startswith(prefix) for name in names):
+                      raise WorkflowError(f"The minimal keyset does not contain {family} keys")
+
+          ca_der = ssl.PEM_cert_to_DER_cert(NINTENDO_CA_PEM)
+          if hashlib.sha256(ca_der).hexdigest() != NINTENDO_CA_SHA256:
+              raise WorkflowError("Embedded Nintendo CA fingerprint verification failed")
+          TLS_CONTEXT = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+          TLS_CONTEXT.minimum_version = ssl.TLSVersion.TLSv1_2
+          TLS_CONTEXT.verify_mode = ssl.CERT_REQUIRED
+          TLS_CONTEXT.check_hostname = True
+          TLS_CONTEXT.load_verify_locations(cadata=NINTENDO_CA_PEM)
+          TLS_CONTEXT.load_cert_chain(CERT_PATH, KEY_PATH)
+
+          def validate_nintendo_url(url):
+              try:
+                  parsed = urllib.parse.urlparse(url)
+                  port = parsed.port
+              except ValueError as error:
+                  raise WorkflowError("Nintendo returned an invalid URL") from error
+              hostname = (parsed.hostname or "").lower()
+              if (
+                  parsed.scheme != "https"
+                  or not hostname.endswith(".d4c.nintendo.net")
+                  or port not in (None, 443)
+                  or parsed.username is not None
+                  or parsed.password is not None
+              ):
+                  raise WorkflowError("A request was redirected outside Nintendo HTTPS")
+
+          class NintendoRedirectHandler(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+                  validate_nintendo_url(new_url)
+                  return super().redirect_request(
+                      request, file_pointer, code, message, headers, new_url
+                  )
+
+          NINTENDO_OPENER = urllib.request.build_opener(
+              urllib.request.ProxyHandler({}),
+              urllib.request.HTTPSHandler(context=TLS_CONTEXT),
+              NintendoRedirectHandler(),
+          )
+
+          def sleep_before_retry(attempt):
+              time.sleep(min(2 ** attempt, 16))
+
+          def open_request(method, url, label, headers=None, attempts=4):
+              validate_nintendo_url(url)
+              request_headers = {"Accept": "*/*", "User-Agent": USER_AGENT}
+              if headers:
+                  request_headers.update(headers)
+              for attempt in range(attempts):
+                  request = urllib.request.Request(
+                      url, method=method, headers=request_headers
+                  )
+                  try:
+                      return NINTENDO_OPENER.open(request, timeout=60)
+                  except urllib.error.HTTPError as error:
+                      if error.code in RETRYABLE_HTTP and attempt + 1 < attempts:
+                          error.close()
+                          sleep_before_retry(attempt)
+                          continue
+                      error.close()
+                      raise HttpStatusError(label, error.code) from None
+                  except (
+                      http.client.HTTPException,
+                      urllib.error.URLError,
+                      TimeoutError,
+                      OSError,
+                  ) as error:
+                      if attempt + 1 < attempts:
+                          sleep_before_retry(attempt)
+                          continue
+                      raise WorkflowError(f"{label} failed after {attempts} attempts") from error
+              raise AssertionError("unreachable")
+
+          def fetch_json(url, label):
+              with open_request(
+                  "GET", url, label, {"Accept": "application/json"}
+              ) as response:
+                  try:
+                      response_data = response.read(MAX_JSON_BYTES + 1)
+                      if len(response_data) > MAX_JSON_BYTES:
+                          raise WorkflowError(f"{label} returned too much JSON data")
+                      return json.loads(response_data)
+                  except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                      raise WorkflowError(f"{label} returned invalid JSON") from error
+                  except (http.client.HTTPException, TimeoutError, OSError) as error:
+                      raise WorkflowError(f"{label} returned an incomplete response") from error
+
+          def decode_version(raw):
+              if type(raw) is not int or not 0 <= raw <= 0xFFFFFFFF:
+                  raise WorkflowError("Nintendo returned an invalid title version")
+              major = raw // 0x4000000
+              remainder = raw - major * 0x4000000
+              minor = remainder // 0x100000
+              remainder -= minor * 0x100000
+              patch = remainder // 0x10000
+              revision = remainder - patch * 0x10000
+              return f"{major}.{minor}.{patch}", revision
+
+          def official_title_version():
+              query = urllib.parse.urlencode({"device_id": DEVICE_ID})
+              url = (
+                  f"https://sun.hac.{ENVIRONMENT}.d4c.nintendo.net/"
+                  f"v1/system_update_meta?{query}"
+              )
+              payload = fetch_json(url, "Nintendo system update metadata request")
+              if not isinstance(payload, dict):
+                  raise WorkflowError("Nintendo returned invalid update metadata")
+              metas = payload.get("system_update_metas")
+              if not isinstance(metas, list) or len(metas) != 1:
+                  raise WorkflowError("Nintendo returned an unexpected update metadata list")
+              meta = metas[0]
+              if not isinstance(meta, dict):
+                  raise WorkflowError("Nintendo returned invalid update metadata")
+              title_id = meta.get("title_id")
+              if not isinstance(title_id, str) or title_id.lower() != "0100000000000816":
+                  raise WorkflowError("Nintendo returned an unexpected system update title ID")
+              raw = meta.get("title_version")
+              simple, revision = decode_version(raw)
+              if simple != VERSION:
+                  raise WorkflowError(
+                      f"Version source mismatch: feed={VERSION}, Nintendo={simple}"
+                  )
+              print(f"任天堂服务器已确认固件版本: {simple} (内部版本号: {revision})")
+              return raw
+
+          def sha256_file(path):
+              digest = hashlib.sha256()
+              with open(path, "rb") as source:
+                  for block in iter(lambda: source.read(1024 * 1024), b""):
+                      digest.update(block)
+              return digest.hexdigest()
+
+          def download_file(
+              url, destination, label, expected_hash=None, expected_size=None
+          ):
+              destination = pathlib.Path(destination)
+              partial = destination.with_name(destination.name + ".part")
+              if expected_hash is not None:
+                  expected_hash = expected_hash.lower()
+                  if not HEX_64.fullmatch(expected_hash):
+                      raise WorkflowError(f"{label} has an invalid expected SHA-256")
+              if expected_size is not None and (
+                  type(expected_size) is not int
+                  or not 0 < expected_size <= MAX_DOWNLOAD_BYTES
+              ):
+                  raise WorkflowError(f"{label} has an invalid expected size")
+              for attempt in range(4):
+                  partial.unlink(missing_ok=True)
+                  try:
+                      with open_request("GET", url, label, attempts=1) as response:
+                          header_hash = response.headers.get("X-Nintendo-Content-Hash", "").lower()
+                          if header_hash and not HEX_64.fullmatch(header_hash):
+                              raise WorkflowError(f"{label} returned an invalid content hash header")
+                          if expected_hash and header_hash and expected_hash != header_hash:
+                              raise WorkflowError(f"{label} returned a conflicting content hash")
+                          content_length_header = response.headers.get("Content-Length")
+                          content_length = None
+                          if content_length_header is not None:
+                              try:
+                                  content_length = int(content_length_header, 10)
+                              except ValueError as error:
+                                  raise WorkflowError(
+                                      f"{label} returned an invalid content length"
+                                  ) from error
+                              if not 0 < content_length <= MAX_DOWNLOAD_BYTES:
+                                  raise WorkflowError(
+                                      f"{label} exceeds the allowed download size"
+                                  )
+                              if (
+                                  expected_size is not None
+                                  and content_length != expected_size
+                              ):
+                                  raise WorkflowError(
+                                      f"{label} returned a conflicting content length"
+                                  )
+                          digest = hashlib.sha256()
+                          downloaded = 0
+                          with open(partial, "wb") as output:
+                              while True:
+                                  block = response.read(1024 * 1024)
+                                  if not block:
+                                      break
+                                  downloaded += len(block)
+                                  if downloaded > MAX_DOWNLOAD_BYTES:
+                                      raise WorkflowError(
+                                          f"{label} exceeds the allowed download size"
+                                      )
+                                  output.write(block)
+                                  digest.update(block)
+                      if downloaded == 0:
+                          raise WorkflowError(f"{label} returned an empty response")
+                      if content_length is not None and downloaded != content_length:
+                          raise WorkflowError(f"{label} returned an incomplete response")
+                      if expected_size is not None and downloaded != expected_size:
+                          raise WorkflowError(f"{label} failed content size verification")
+                      actual_hash = digest.hexdigest()
+                      required_hash = expected_hash or header_hash
+                      if required_hash and actual_hash != required_hash:
+                          raise WorkflowError(f"{label} failed SHA-256 verification")
+                      os.replace(partial, destination)
+                      return actual_hash
+                  except (
+                      WorkflowError,
+                      http.client.HTTPException,
+                      urllib.error.URLError,
+                      TimeoutError,
+                      OSError,
+                  ) as error:
+                      partial.unlink(missing_ok=True)
+                      if isinstance(error, HttpStatusError) and error.status not in RETRYABLE_HTTP:
+                          raise
+                      if attempt + 1 == 4:
+                          if isinstance(error, WorkflowError):
+                              raise
+                          raise WorkflowError(f"{label} download failed") from error
+                      sleep_before_retry(attempt)
+              raise AssertionError("unreachable")
+
+          def read_u16(data, offset):
+              if offset < 0 or offset + 2 > len(data):
+                  raise WorkflowError("CNMT contains an out-of-bounds uint16 field")
+              return struct.unpack_from("<H", data, offset)[0]
+
+          def read_u32(data, offset):
+              if offset < 0 or offset + 4 > len(data):
+                  raise WorkflowError("CNMT contains an out-of-bounds uint32 field")
+              return struct.unpack_from("<I", data, offset)[0]
+
+          def read_u64(data, offset):
+              if offset < 0 or offset + 8 > len(data):
+                  raise WorkflowError("CNMT contains an out-of-bounds uint64 field")
+              return struct.unpack_from("<Q", data, offset)[0]
+
+          def checked_slice(data, offset, size):
+              if offset < 0 or size < 0 or offset + size > len(data):
+                  raise WorkflowError("CNMT contains an out-of-bounds entry")
+              return data[offset:offset + size]
+
+          def parse_cnmt(
+              nca_path, expect_system_update, expected_title_id, expected_title_version
+          ):
+              extract_dir = pathlib.Path(
+                  tempfile.mkdtemp(prefix="cnmt-", dir=WORK_DIR)
+              )
+              try:
+                  result = subprocess.run(
+                      [
+                          HACTOOL_PATH,
+                          "-k",
+                          KEYSET_PATH,
+                          str(nca_path),
+                          "--section0dir",
+                          str(extract_dir),
+                      ],
+                      stdout=subprocess.DEVNULL,
+                      stderr=subprocess.PIPE,
+                      env={"LANG": "C", "LC_ALL": "C"},
+                      text=True,
+                      timeout=120,
+                      check=False,
+                  )
+                  cnmt_files = sorted(extract_dir.glob("*.cnmt"))
+                  if result.returncode != 0 or len(cnmt_files) != 1:
+                      raise WorkflowError("hactool could not extract exactly one CNMT file")
+                  if cnmt_files[0].stat().st_size > MAX_CNMT_BYTES:
+                      raise WorkflowError("Extracted CNMT exceeds the allowed size")
+                  data = cnmt_files[0].read_bytes()
+              except subprocess.TimeoutExpired as error:
+                  raise WorkflowError("hactool timed out while extracting CNMT") from error
+              finally:
+                  shutil.rmtree(extract_dir, ignore_errors=True)
+
+              if len(data) < 0x20:
+                  raise WorkflowError("Extracted CNMT is too small")
+              actual_title_id = f"{read_u64(data, 0):016x}"
+              actual_title_version = read_u32(data, 8)
+              if (
+                  actual_title_id != expected_title_id
+                  or actual_title_version != expected_title_version
+              ):
+                  raise WorkflowError("CNMT identity does not match the requested title")
+              content_type = data[0x0C]
+              is_system_update = content_type == 0x03
+              if is_system_update != expect_system_update:
+                  raise WorkflowError("CNMT content type does not match the requested title")
+              extended_header_size = read_u16(data, 0x0E)
+              base = 0x20 + extended_header_size
+              content_count = read_u16(data, 0x10)
+              content_meta_count = read_u16(data, 0x12)
+              if content_count > MAX_CNMT_CONTENTS:
+                  raise WorkflowError("CNMT contains too many content records")
+              checked_slice(data, base, content_count * 0x38)
+              entries = []
+              if is_system_update:
+                  if content_count != 0:
+                      raise WorkflowError(
+                          "System update CNMT unexpectedly contains content records"
+                      )
+                  count = content_meta_count
+                  if count > MAX_SYSTEM_TITLES:
+                      raise WorkflowError("System update CNMT contains too many titles")
+                  content_meta_base = base + content_count * 0x38
+                  checked_slice(data, content_meta_base, count * 0x10)
+                  for index in range(count):
+                      offset = content_meta_base + index * 0x10
+                      title_id = f"{read_u64(data, offset):016x}"
+                      title_version = read_u32(data, offset + 8)
+                      entries.append((title_id, title_version))
+              else:
+                  count = content_count
+                  for index in range(count):
+                      offset = base + index * 0x38
+                      content_hash = checked_slice(data, offset, 32).hex()
+                      content_id = checked_slice(data, offset + 32, 16).hex()
+                      content_size = int.from_bytes(
+                          checked_slice(data, offset + 0x30, 6), "little"
+                      )
+                      if not HEX_32.fullmatch(content_id) or not HEX_64.fullmatch(content_hash):
+                          raise WorkflowError("CNMT contains an invalid content record")
+                      if not 0 < content_size <= MAX_DOWNLOAD_BYTES:
+                          raise WorkflowError("CNMT contains an invalid content size")
+                      entries.append((content_id, content_hash, content_size))
+              if is_system_update and not entries:
+                  raise WorkflowError("System update CNMT does not contain any title entries")
+              return entries
+
+          def title_url(kind, title_id, title_version):
+              query = urllib.parse.urlencode({"device_id": DEVICE_ID})
+              return (
+                  f"https://atumn.hac.{ENVIRONMENT}.d4c.nintendo.net/"
+                  f"t/{kind}/{title_id}/{title_version}?{query}"
+              )
+
+          def content_url(kind, content_id):
+              return (
+                  f"https://atumn.hac.{ENVIRONMENT}.d4c.nintendo.net/"
+                  f"c/{kind}/{content_id}"
+              )
+
+          seen_titles = set()
+          content_queue = {}
+          system_version_fat = None
+          system_version_exfat = None
+
+          def download_title(title_id, title_version, is_system_update=False, optional=False):
+              global system_version_fat, system_version_exfat
+
+              title_id = title_id.lower()
+              if not HEX_16.fullmatch(title_id):
+                  raise WorkflowError("CNMT returned an invalid title ID")
+              if type(title_version) is not int or not 0 <= title_version <= 0xFFFFFFFF:
+                  raise WorkflowError("CNMT returned an invalid title version")
+              key = (title_id, title_version, is_system_update)
+              if key in seen_titles:
+                  return True
+              if len(seen_titles) >= MAX_SYSTEM_TITLES:
+                  raise WorkflowError("System update references too many titles")
+              seen_titles.add(key)
+              kind = "s" if is_system_update else "a"
+              label = f"title metadata {title_id}"
+              try:
+                  with open_request(
+                      "HEAD", title_url(kind, title_id, title_version), label
+                  ) as response:
+                      content_id = response.headers.get("X-Nintendo-Content-ID", "").lower()
+                      content_hash = response.headers.get("X-Nintendo-Content-Hash", "").lower()
+              except HttpStatusError as error:
+                  if optional and error.status == 404:
+                      seen_titles.remove(key)
+                      return False
+                  raise
+              if not HEX_32.fullmatch(content_id):
+                  raise WorkflowError(f"{label} returned an invalid content ID")
+              if not HEX_64.fullmatch(content_hash):
+                  raise WorkflowError(f"{label} returned an invalid content hash")
+
+              cnmt_nca = FIRMWARE_DIR / f"{content_id}.cnmt.nca"
+              download_file(
+                  content_url(kind, content_id),
+                  cnmt_nca,
+                  f"CNMT NCA {content_id}",
+                  content_hash,
+              )
+              entries = parse_cnmt(
+                  cnmt_nca, is_system_update, title_id, title_version
+              )
+              if is_system_update:
+                  for nested_title_id, nested_version in entries:
+                      download_title(nested_title_id, nested_version)
+              else:
+                  for nca_id, nca_hash, nca_size in entries:
+                      existing = content_queue.get(nca_id)
+                      if existing and existing != (nca_hash, nca_size):
+                          raise WorkflowError(
+                              "Conflicting metadata was found for one content ID"
+                          )
+                      if existing is None and len(content_queue) >= MAX_CONTENT_ITEMS:
+                          raise WorkflowError("Firmware references too many content records")
+                      content_queue[nca_id] = (nca_hash, nca_size)
+                      if title_id == "0100000000000809":
+                          system_version_fat = f"{nca_id}.nca"
+                      elif title_id == "010000000000081b":
+                          system_version_exfat = f"{nca_id}.nca"
+              return True
+
+          def download_content_item(item):
+              nca_id, (nca_hash, nca_size) = item
+              destination = FIRMWARE_DIR / f"{nca_id}.nca"
+              download_file(
+                  content_url("c", nca_id),
+                  destination,
+                  f"content NCA {nca_id}",
+                  nca_hash,
+                  nca_size,
+              )
+              return nca_id
+
+          def create_archive():
+              archive = DIST_DIR / f"Firmware {VERSION}.zip"
+              with zipfile.ZipFile(
+                  archive, "w", compression=zipfile.ZIP_STORED, allowZip64=True
+              ) as output_zip:
+                  for source in sorted(FIRMWARE_DIR.iterdir(), key=lambda path: path.name):
+                      if not source.is_file():
+                          raise WorkflowError("Unexpected directory found in firmware staging")
+                      info = zipfile.ZipInfo(source.name, date_time=(1980, 1, 1, 0, 0, 0))
+                      info.compress_type = zipfile.ZIP_STORED
+                      info.create_system = 0
+                      info.external_attr = 0
+                      with open(source, "rb") as input_file:
+                          with output_zip.open(info, "w", force_zip64=True) as output_file:
+                              shutil.copyfileobj(input_file, output_file, 1024 * 1024)
+              os.chmod(archive, 0o600)
+              return archive, sha256_file(archive)
+
+          def main():
+              validate_inputs()
+              FIRMWARE_DIR.mkdir(mode=0o700)
+              raw_version = official_title_version()
+              download_title("0100000000000816", raw_version, is_system_update=True)
+              if system_version_fat is None:
+                  raise WorkflowError("FAT SystemVersion NCA was not identified")
+              if system_version_exfat is None:
+                  print("正在尝试获取可选的 exFAT 系统版本组件 (010000000000081b)")
+                  download_title(
+                      "010000000000081b", raw_version, optional=True
+                  )
+              if not content_queue:
+                  raise WorkflowError("未加入任何内容 NCA 下载队列")
+              total_content_size = sum(
+                  nca_size for _, nca_size in content_queue.values()
+              )
+              if total_content_size > MAX_TOTAL_CONTENT_BYTES:
+                  raise WorkflowError("固件总大小超出允许上限")
+
+              print(f"开始并发下载并校验 {len(content_queue)} 个内容 NCA 文件...")
+              with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                  futures = [
+                      executor.submit(download_content_item, item)
+                      for item in sorted(content_queue.items())
+                  ]
+                  for completed, future in enumerate(
+                      concurrent.futures.as_completed(futures), 1
+                  ):
+                      future.result()
+                      if completed % 25 == 0 or completed == len(futures):
+                          print(f"已完成校验 {completed}/{len(futures)} 个内容 NCA 文件")
+
+              archive, archive_hash = create_archive()
+              notes = DIST_DIR / "release-notes.txt"
+              notes.write_text(
+                  "\n".join(
+                      [
+                          f"Nintendo Switch 官方固件版本 {VERSION} 自动下载发布。",
+                          "",
+                          "固件文件详情：",
+                          f"- 固件压缩包：{archive.name}",
+                          f"- 系统版本 NCA (FAT32)：{system_version_fat}",
+                          f"- 系统版本 NCA (exFAT)：{system_version_exfat or '未找到'}",
+                          f"- 压缩包 SHA-256 校验和：{archive_hash}",
+                          "所有内容 NCA 文件哈希均已通过官方 CNMT 元数据完整性验证。",
+                      ]
+                  ) + "\n",
+                  encoding="utf-8",
+              )
+              os.chmod(notes, 0o600)
+              print(f"固件压缩包打包完成: {archive.name}")
+              print(f"压缩包 SHA-256: {archive_hash}")
+
+          try:
+              main()
+          except WorkflowError as error:
+              raise SystemExit(f"固件下载与发布工作流执行失败: {error}") from None
+          PY
+
+          unset device_id NX_CLIENT_CERT_PATH NX_CLIENT_KEY_PATH
+          unset NX_HACTOOL_KEYS_PATH NX_WORK_DIR NX_HACTOOL_PATH
+
+      - name: 发布已验证的 GitHub Release
+        shell: bash
+        env:
+          DIST_DIR: ${{ runner.temp }}/nx-firmware-dist
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          set +x
+          command -v gh >/dev/null
+          archive="$DIST_DIR/Firmware $VERSION.zip"
+          notes="$DIST_DIR/release-notes.txt"
+          test -s "$archive"
+          test -s "$notes"
+          asset_name="$(basename "$archive")"
+          archive_size="$(stat --format='%s' "$archive")"
+          archive_sha256="$(sha256sum "$archive" | cut -d ' ' -f 1)"
+          release_json="$RUNNER_TEMP/nx-release-$GITHUB_RUN_ID.json"
+          release_pages="$RUNNER_TEMP/nx-release-pages-$GITHUB_RUN_ID.json"
+          tag_json="$RUNNER_TEMP/nx-tag-$GITHUB_RUN_ID.json"
+          tag_error="$RUNNER_TEMP/nx-tag-$GITHUB_RUN_ID.error"
+          trap 'rm -f "$release_json" "$release_pages" "$tag_json" "$tag_error"' EXIT
+
+          validate_existing_tag() {
+            local max_attempts="${1:-1}"
+            local attempt=1
+            while [ $attempt -le $max_attempts ]; do
+              if gh api \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2026-03-10" \
+                "repos/$GH_REPOSITORY/git/ref/tags/$VERSION" \
+                > "$tag_json" 2> "$tag_error"; then
+                tag_commit="$(python3 - "$tag_json" "$VERSION" <<'PY'
+          import json
+          import pathlib
+          import re
+          import sys
+
+          payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          expected_ref = f"refs/tags/{sys.argv[2]}"
+          if not isinstance(payload, dict) or payload.get("ref") != expected_ref:
+              raise SystemExit("GitHub returned an unexpected tag reference")
+          tag_object = payload.get("object")
+          if not isinstance(tag_object, dict) or tag_object.get("type") != "commit":
+              raise SystemExit("The firmware tag must be a lightweight commit tag")
+          tag_commit = tag_object.get("sha")
+          if not isinstance(tag_commit, str) or not re.fullmatch(
+              r"[0-9a-f]{40,64}", tag_commit
+          ):
+              raise SystemExit("GitHub returned an invalid tag commit")
+          print(tag_commit)
+          PY
+                )"
+                [[ "$tag_commit" =~ ^[0-9a-f]{40,64}$ ]] || {
+                  echo "GitHub returned an invalid tag commit" >&2
+                  return 1
+                }
+                compare_status="$(
+                  gh api \
+                    -H "Accept: application/vnd.github+json" \
+                    -H "X-GitHub-Api-Version: 2026-03-10" \
+                    "repos/$GH_REPOSITORY/compare/$tag_commit...$GITHUB_SHA" \
+                    --jq '.status'
+                )"
+                case "$compare_status" in
+                  ahead|identical)
+                    printf 'true\n'
+                    return 0
+                    ;;
+                  *)
+                    echo "The existing firmware tag is not on the current default-branch history" >&2
+                    return 1
+                    ;;
+                esac
+              elif grep -Eq '\(HTTP 404\)[[:space:]]*$' "$tag_error"; then
+                if [ $attempt -eq $max_attempts ]; then
+                  printf 'false\n'
+                  return 0
+                fi
+              else
+                sed 's/^/GitHub tag lookup failed: /' "$tag_error" >&2
+                return 1
+              fi
+              attempt=$((attempt + 1))
+              sleep 2
+            done
+            printf 'false\n'
+          }
+
+          lookup_release() {
+            local max_attempts="${1:-1}"
+            local attempt=1
+            while [ $attempt -le $max_attempts ]; do
+              gh api \
+                --paginate \
+                --slurp \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2026-03-10" \
+                "repos/$GH_REPOSITORY/releases?per_page=100" > "$release_pages"
+              local found
+              found="$(python3 - "$release_pages" "$release_json" "$VERSION" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          pages_path, release_path, expected_tag = sys.argv[1:]
+          pages = json.loads(pathlib.Path(pages_path).read_text(encoding="utf-8"))
+          if not isinstance(pages, list) or not all(
+              isinstance(page, list) for page in pages
+          ):
+              raise SystemExit("GitHub returned an invalid paginated release list")
+          matches = [
+              release
+              for page in pages
+              for release in page
+              if isinstance(release, dict) and release.get("tag_name") == expected_tag
+          ]
+          if len(matches) > 1:
+              raise SystemExit("GitHub returned duplicate releases for the firmware tag")
+          output = pathlib.Path(release_path)
+          if not matches:
+              output.unlink(missing_ok=True)
+              print("false")
+          else:
+              output.write_text(json.dumps(matches[0]), encoding="utf-8")
+              print("true")
+          PY
+                )"
+              if [ "$found" = "true" ]; then
+                printf 'true\n'
+                return 0
+              fi
+              attempt=$((attempt + 1))
+              if [ $attempt -le $max_attempts ]; then
+                sleep 2
+              fi
+            done
+            printf 'false\n'
+          }
+
+          read_release_state() {
+            python3 - "$release_json" "$VERSION" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          payload = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if not isinstance(payload, dict) or payload.get("tag_name") != sys.argv[2]:
+              raise SystemExit("GitHub returned an unexpected release")
+          release_id = payload.get("id")
+          if type(release_id) is not int or release_id <= 0:
+              raise SystemExit("GitHub returned an invalid release ID")
+          if payload.get("immutable") is True:
+              raise SystemExit("The incomplete release is immutable and cannot be repaired")
+          if type(payload.get("draft")) is not bool:
+              raise SystemExit("GitHub returned an invalid release state")
+          print(release_id, "true" if payload["draft"] else "false")
+          PY
+          }
+
+          verify_release() {
+            local max_attempts="${1:-5}"
+            local attempt=1
+            while [ $attempt -le $max_attempts ]; do
+              gh api \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2026-03-10" \
+                "repos/$GH_REPOSITORY/releases/$release_id" > "$release_json"
+              local result
+              if result="$(python3 - \
+                "$release_json" "$release_id" "$VERSION" "$asset_name" \
+                "$archive_size" "$archive_sha256" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          (
+              release_path,
+              expected_release_id_text,
+              expected_tag,
+              expected_name,
+              expected_size_text,
+              expected_sha256,
+          ) = sys.argv[1:]
+          expected_release_id = int(expected_release_id_text)
+          expected_size = int(expected_size_text)
+          payload = json.loads(pathlib.Path(release_path).read_text(encoding="utf-8"))
+          if (
+              not isinstance(payload, dict)
+              or payload.get("id") != expected_release_id
+              or payload.get("tag_name") != expected_tag
+          ):
+              raise SystemExit("GitHub returned an unexpected release")
+          if type(payload.get("draft")) is not bool:
+              raise SystemExit("GitHub returned an invalid release state")
+          if payload.get("prerelease") is not False:
+              raise SystemExit("The GitHub release is still marked as a prerelease")
+          assets = payload.get("assets")
+          if not isinstance(assets, list):
+              raise SystemExit("GitHub returned an invalid asset list")
+          matches = [
+              asset
+              for asset in assets
+              if isinstance(asset, dict)
+              and asset.get("name") in (expected_name, expected_name.replace(" ", "."))
+          ]
+          if len(matches) != 1:
+              raise SystemExit("The expected release asset is missing or duplicated")
+          asset = matches[0]
+          if asset.get("state") != "uploaded" or asset.get("size") != expected_size:
+              raise SystemExit("The uploaded release asset failed remote size verification")
+          remote_digest = asset.get("digest")
+          if remote_digest is not None and remote_digest != f"sha256:{expected_sha256}":
+              raise SystemExit("The uploaded release asset failed remote digest verification")
+          print("true" if payload["draft"] else "false")
+          PY
+              )"; then
+                printf '%s\n' "$result"
+                return 0
+              fi
+              attempt=$((attempt + 1))
+              if [ $attempt -le $max_attempts ]; then
+                sleep 2
+              fi
+            done
+            return 1
+          }
+
+          tag_exists="$(validate_existing_tag)"
+          release_exists="$(lookup_release)"
+          if [ "$release_exists" = "true" ]; then
+            release_state="$(read_release_state)"
+            release_id="${release_state%% *}"
+            existing_draft="${release_state##* }"
+            if [ "$existing_draft" = "false" ] && [ "$tag_exists" != "true" ]; then
+              echo "A published release is missing its Git tag" >&2
+              exit 1
+            fi
+            if [ "$existing_draft" = "true" ] && [ "$tag_exists" = "false" ]; then
+              gh release edit "$VERSION" \
+                --repo "$GH_REPOSITORY" \
+                --target "$GITHUB_SHA" \
+                --title "Firmware $VERSION" \
+                --prerelease=false \
+                --notes-file "$notes"
+            else
+              gh release edit "$VERSION" \
+                --repo "$GH_REPOSITORY" \
+                --title "Firmware $VERSION" \
+                --prerelease=false \
+                --notes-file "$notes"
+            fi
+          elif [ "$release_exists" = "false" ]; then
+            gh release create "$VERSION" \
+              --repo "$GH_REPOSITORY" \
+              --draft \
+              --target "$GITHUB_SHA" \
+              --title "Firmware $VERSION" \
+              --notes-file "$notes"
+            test "$(lookup_release 5)" = "true"
+            release_state="$(read_release_state)"
+            release_id="${release_state%% *}"
+            existing_draft="${release_state##* }"
+            test "$existing_draft" = "true"
+          else
+            echo "GitHub returned an invalid release lookup state" >&2
+            exit 1
+          fi
+
+          gh release upload "$VERSION" "$archive" \
+            --repo "$GH_REPOSITORY" \
+            --clobber
+
+          release_draft="$(verify_release 5)"
+          if [ "$release_draft" = "true" ]; then
+            validate_existing_tag >/dev/null
+            gh release edit "$VERSION" \
+              --repo "$GH_REPOSITORY" \
+              --draft=false \
+              --prerelease=false \
+              --latest
+          fi
+
+          final_draft="$(verify_release 5)"
+          test "$final_draft" = "false"
+          final_tag_exists="$(validate_existing_tag 5)"
+          test "$final_tag_exists" = "true"
